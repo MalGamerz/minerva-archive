@@ -115,12 +115,10 @@ def run_cli(args: argparse.Namespace) -> None:
         try:
             _cli_log(f"Starting (concurrency={conc}, aria2c_conns={aria})…")
             loop.run_until_complete(engine.run_loop())
-        except Exception as e:
-            _cli_log(f"FATAL Engine Error: {type(e).__name__}: {e}")
         except KeyboardInterrupt:
             _cli_log("Interrupt received. Stopping…")
-            engine.stop_event.set()
-            loop.run_until_complete(asyncio.sleep(1))
+            engine.force_stop()
+            time.sleep(1)
         finally:
             executor.shutdown(wait=False)
             loop.close()
@@ -164,6 +162,7 @@ def run_gui() -> None:
             self.token: str | None = MinervaAuth.load_token()
             self.job_frames: dict[str, dict] = {}
             self._last_gui_update: dict[str, float] = {}
+            self._worker_loop: asyncio.AbstractEventLoop | None = None
 
             self._build_ui()
             self._refresh_auth_ui()
@@ -177,7 +176,6 @@ def run_gui() -> None:
             self.grid_rowconfigure(0, weight=1)
             self.grid_columnconfigure(1, weight=1)
 
-            # Sidebar
             sb = ctk.CTkFrame(self, width=220, corner_radius=0, fg_color="#181818")
             sb.grid(row=0, column=0, sticky="nsew")
             sb.grid_rowconfigure(10, weight=1)
@@ -236,13 +234,11 @@ def run_gui() -> None:
             )
             self._run_lbl.grid(row=9, column=0, pady=(10, 0))
 
-            # Main panel
             main = ctk.CTkFrame(self, fg_color="#0A0A0A", corner_radius=0)
             main.grid(row=0, column=1, sticky="nsew")
             main.grid_rowconfigure(2, weight=1)
             main.grid_columnconfigure(0, weight=1)
 
-            # Settings
             sf = ctk.CTkFrame(main, fg_color="transparent")
             sf.grid(row=0, column=0, sticky="ew", padx=20, pady=20)
             sf.grid_columnconfigure((0, 1, 2), weight=1)
@@ -354,8 +350,7 @@ def run_gui() -> None:
 
         def job_update_safe(self, uid: str, pct: float, speed: str, status: str, size: str, eta: str = "") -> None:
             now = time.time()
-            # Hard throttle: max 10 UI updates per second per file to prevent lag
-            if status not in ("Complete", "Skipped", "Failed") and 0.0 < pct < 1.0:
+            if status not in ("Complete", "Skipped", "Failed", "Halted") and 0.0 < pct < 1.0:
                 last_time = self._last_gui_update.get(uid, 0)
                 if now - last_time < 0.1:
                     return
@@ -369,10 +364,10 @@ def run_gui() -> None:
                 w["speed"].configure(text=speed)
                 w["size"].configure(text=size)
                 if eta: w["eta"].configure(text=eta)
-                if status == "Failed":
+                if status in ("Failed", "Halted"):
                     w["stat"].configure(text_color="#F44336")
                     w["bar"].configure(progress_color="#F44336")
-                if pct >= 1.0 and status in ("Complete", "Skipped"):
+                if pct >= 1.0 and status in ("Complete", "Skipped", "Halted"):
                     def _rm():
                         if uid in self.job_frames:
                             self.job_frames[uid]["frame"].destroy()
@@ -395,6 +390,9 @@ def run_gui() -> None:
             self.token = None
             self.log_safe("Token deleted.")
             self._refresh_auth_ui()
+
+        def _monitor_thread(self):
+            pass  # No longer used — _on_stopped is called directly by the worker thread.
 
         def _start_worker(self) -> None:
             if (self.worker_thread and self.worker_thread.is_alive()) or self.worker_engine:
@@ -427,13 +425,12 @@ def run_gui() -> None:
             self._stop_btn.configure(state="normal")
             self._run_lbl.configure(text="🟢 Running", text_color="#4CAF50")
 
+            loop = asyncio.new_event_loop()
+            self._worker_loop = loop
+            self.worker_engine = WorkerEngine(config, callbacks)
+
             def _run():
-                loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                self._worker_loop = loop  
-                
-                self.worker_engine = WorkerEngine(config, callbacks)
-                
                 cpu = os.cpu_count() or 1
                 self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=cpu * 4)
                 loop.set_default_executor(self.executor)
@@ -443,26 +440,40 @@ def run_gui() -> None:
                 except Exception as e:
                     self.log_safe(f"FATAL Engine Error: {type(e).__name__}: {e}")
                 finally:
-                    self.after(0, self._on_stopped)
+                    try:
+                        loop.run_until_complete(loop.shutdown_asyncgens())
+                    except Exception:
+                        pass
                     loop.close()
+                    # Tell the GUI thread we are done — guaranteed to fire no matter what.
+                    self.after(0, self._on_stopped)
 
             self.worker_thread = threading.Thread(target=_run, daemon=True)
             self.worker_thread.start()
 
         def _stop_worker(self) -> None:
-            if getattr(self, "worker_engine", None) and getattr(self, "_worker_loop", None):
+            engine = getattr(self, "worker_engine", None)
+            loop = getattr(self, "_worker_loop", None)
+            if engine is not None:
                 self.log_safe("Stopping…")
-                self._worker_loop.call_soon_threadsafe(self.worker_engine.stop_event.set)
                 self._stop_btn.configure(state="disabled")
+                if loop is not None and loop.is_running():
+                    loop.call_soon_threadsafe(engine.force_stop)
+                else:
+                    engine.force_stop()
 
         def _on_stopped(self) -> None:
-            self._start_btn.configure(state="normal")
-            self._stop_btn.configure(state="disabled")
-            self._run_lbl.configure(text="⚪ Stopped", text_color="gray")
             self.worker_engine = None
+            self._worker_loop = None
+            self.worker_thread = None
             if self.executor:
                 self.executor.shutdown(wait=False)
                 self.executor = None
+            # Only re-enable Start if the user is still logged in
+            if self.token:
+                self._start_btn.configure(state="normal", fg_color="#1E3320", hover_color="#2E4A31")
+            self._stop_btn.configure(state="disabled")
+            self._run_lbl.configure(text="⚪ Stopped", text_color="gray")
 
     app = MinervaApp()
     app.mainloop()
