@@ -1,4 +1,6 @@
-# Minerva Archive — DPN Worker (GUI Edition)
+# Minerva Archive — DPN Worker (Unofficial GUI Edition)
+
+> **⚠️ Disclaimer:** This is an unofficial, community-developed graphical interface for the Minerva DPN Worker. It is not affiliated with, maintained by, or officially endorsed by the Minerva Archive team. Please do not direct support requests for this GUI to the official Minerva maintainers.
 
 A high-performance, graphical worker client for the Minerva Distributed Preservation Network. This tool allows volunteers to help archive the internet by efficiently downloading files from source servers and uploading them safely to the Minerva archive.
 
