@@ -24,6 +24,16 @@ from auth import MinervaAuth
 from engine import WorkerEngine
 from utils import has_display
 
+def clean_up_old_updates():
+    """Removes the leftover .old executable from a previous auto-update."""
+    if getattr(sys, 'frozen', False):
+        old_exe = sys.executable + ".old"
+        if os.path.exists(old_exe):
+            try:
+                os.remove(old_exe)
+            except OSError:
+                pass # If it's still briefly locked, it will get caught on the next run
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI front-end
@@ -484,6 +494,8 @@ def run_gui() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    clean_up_old_updates()
+    
     parser = argparse.ArgumentParser(
         prog="minerva-worker",
         description="Minerva DPN Worker — auto-selects GUI or CLI based on environment.",
