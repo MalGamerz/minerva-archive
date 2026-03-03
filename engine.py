@@ -8,11 +8,10 @@ import os
 import random
 import shutil
 import sys
+import threading
 import time
 import urllib.parse
 from pathlib import Path
-
-import threading
 
 import httpx
 
@@ -30,9 +29,6 @@ class WorkerEngine:
     def __init__(self, config: dict, ui_callbacks: dict):
         self.cfg = config
         self.ui = ui_callbacks
-        # asyncio.Event must be created inside the running event loop.
-        # Use a threading.Event as the cross-thread stop signal; run_loop()
-        # creates the asyncio.Event once it is actually running.
         self._stop_flag = threading.Event()
         self.stop_event: asyncio.Event | None = None
         self.headers = {
@@ -47,10 +43,11 @@ class WorkerEngine:
             keepalive_expiry=30,
         )
         
-        # Trackers for the OS-Level Nuclear Stop
+        # Trackers for the OS-Level Nuclear Stop and Updates
         self.active_tasks = []
         self.active_procs = set()
         self.prod_task = None
+        self._is_updating = False
 
     def force_stop(self) -> None:
         """Signal stop via threading flag, then wake the asyncio event if available."""
@@ -75,6 +72,55 @@ class WorkerEngine:
             
         if self.prod_task:
             self.prod_task.cancel()
+
+    async def _auto_update(self) -> None:
+        """Downloads the latest executable, swaps it, and restarts."""
+        if self._is_updating:
+            return
+        self._is_updating = True
+        
+        self.ui["log"]("Client is outdated (426). Initiating auto-update...")
+        self.force_stop()  # Halt all current downloads/uploads
+
+        is_frozen = getattr(sys, 'frozen', False)
+        current_file = sys.executable if is_frozen else os.path.abspath(sys.argv[0])
+        os_name = "windows" if sys.platform == "win32" else "linux"
+        update_url = f"{self.cfg['api_server']}/api/update/latest/{os_name}"
+
+        try:
+            self.ui["log"](f"Downloading latest {os_name} version...")
+            
+            # Windows locks running executables, but allows renaming them
+            if is_frozen:
+                old_file = current_file + ".old"
+                if os.path.exists(old_file):
+                    os.remove(old_file)
+                os.rename(current_file, old_file)
+            
+            async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+                async with client.stream("GET", update_url) as r:
+                    r.raise_for_status()
+                    with open(current_file, "wb") as f:
+                        async for chunk in r.aiter_bytes(65_536):
+                            f.write(chunk)
+
+            if sys.platform != "win32":
+                os.chmod(current_file, 0o755)
+
+            self.ui["log"]("Update complete. Restarting worker...")
+            
+            # Replace the current process with the new binary
+            if is_frozen:
+                os.execv(current_file, [current_file] + sys.argv[1:])
+            else:
+                os.execv(sys.executable, [sys.executable, current_file] + sys.argv[1:])
+
+        except Exception as e:
+            self.ui["log"](f"Auto-update failed: {e}")
+            # Rollback rename if it failed
+            if is_frozen and os.path.exists(current_file + ".old") and not os.path.exists(current_file):
+                os.rename(current_file + ".old", current_file)
+            self._is_updating = False
 
     def _redact(self, text: str) -> str:
         token = self.cfg.get("token") or ""
@@ -271,6 +317,37 @@ class WorkerEngine:
                             f"{downloaded // 1_048_576} MB / {total // 1_048_576} MB", f"ETA: {em}m {es}s",
                         )
 
+    async def _monitor_download(self, file_id: str, download_task: asyncio.Task, clean_name: str) -> None:
+        """
+        Periodically polls the upload server while the download task is running.
+        If another worker finishes the upload (server returns 409) or an update is needed (426),
+        it cancels the download.
+        """
+        async with httpx.AsyncClient(timeout=10.0, limits=self._http_limits) as client:
+            while not download_task.done():
+                if self._stop_flag.is_set():
+                    break
+                try:
+                    resp = await client.head(
+                        f"{self.cfg['upload_server']}/api/upload/{file_id}/start", 
+                        headers=self.headers
+                    )
+                    if resp.status_code == 426:
+                        asyncio.create_task(self._auto_update())
+                        download_task.cancel()
+                        break
+                    if resp.status_code == 409:
+                        self.ui["log"](f"[{clean_name}] Preempted! Another worker finished this file. Aborting.")
+                        download_task.cancel()
+                        break
+                except httpx.RequestError:
+                    pass 
+                
+                try:
+                    await asyncio.wait_for(asyncio.shield(download_task), timeout=30.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+
     async def upload_file(self, file_id, path: Path, ui_job_id: str) -> None:
         timeout = httpx.Timeout(connect=15, read=120, write=120, pool=30)
         async with httpx.AsyncClient(timeout=timeout, limits=self._http_limits) as client:
@@ -286,6 +363,9 @@ class WorkerEngine:
                 resp = await client.post(
                     f"{self.cfg['upload_server']}/api/upload/{file_id}/start", headers=self.headers,
                 )
+                if resp.status_code == 426:
+                    asyncio.create_task(self._auto_update())
+                    raise asyncio.CancelledError("426_UPDATE_REQUIRED")
                 if resp.status_code == 409: raise FileExistsError("409_CONFLICT")
                 if resp.status_code in RETRIABLE_STATUS_CODES:
                     await asyncio.sleep(_retry_sleep(attempt))
@@ -323,6 +403,9 @@ class WorkerEngine:
                             headers={**self.headers, "Content-Type": "application/octet-stream"},
                             content=data,
                         )
+                        if resp.status_code == 426:
+                            asyncio.create_task(self._auto_update())
+                            raise asyncio.CancelledError("426_UPDATE_REQUIRED")
                         if resp.status_code == 409: raise FileExistsError("409_CONFLICT")
                         if resp.status_code in RETRIABLE_STATUS_CODES:
                             await asyncio.sleep(_retry_sleep(attempt, cap=20.0))
@@ -356,6 +439,9 @@ class WorkerEngine:
                     params={"session_id": session_id, "expected_sha256": expected_sha256},
                     headers=self.headers,
                 )
+                if resp.status_code == 426:
+                    asyncio.create_task(self._auto_update())
+                    raise asyncio.CancelledError("426_UPDATE_REQUIRED")
                 if resp.status_code == 409: raise FileExistsError("409_CONFLICT")
                 if resp.status_code in RETRIABLE_STATUS_CODES:
                     await asyncio.sleep(_retry_sleep(attempt, cap=20.0))
@@ -388,7 +474,25 @@ class WorkerEngine:
 
         try:
             await asyncio.sleep(random.uniform(0.5, 2.0))
-            await self.download_file(url, local_path, job.get("size", 0), ui_job_id)
+            
+            # Start the download as a separate task
+            dl_task = asyncio.create_task(
+                self.download_file(url, local_path, job.get("size", 0), ui_job_id)
+            )
+            
+            # Start the background monitor to check if another worker finishes it first or an update is forced
+            monitor_task = asyncio.create_task(
+                self._monitor_download(file_id, dl_task, clean_name)
+            )
+            
+            try:
+                await dl_task
+            except asyncio.CancelledError:
+                # If the monitor task cancelled the download, it might be due to a 409 or 426
+                if monitor_task.done() and not self._stop_flag.is_set() and not self._is_updating:
+                    raise FileExistsError("409_CONFLICT")
+                raise
+
             file_size = local_path.stat().st_size if local_path.exists() else 0
 
             self.ui["progress"](ui_job_id, 0.0, "↑ 0.0 MB/s", "Uploading", "Connecting…", "ETA: --")
@@ -399,7 +503,8 @@ class WorkerEngine:
             await self.report_job(file_id, "completed", bytes_downloaded=file_size)
 
         except asyncio.CancelledError:
-            self.ui["progress"](ui_job_id, 0.0, "Halted", "Halted", "User Stopped", "ETA: --")
+            if not self._is_updating:
+                self.ui["progress"](ui_job_id, 0.0, "Halted", "Halted", "User Stopped", "ETA: --")
             raise
         except FileExistsError:
             self.ui["log"](f"[{clean_name}] Skipped: already archived (409).")
@@ -420,10 +525,8 @@ class WorkerEngine:
                 pass
 
     async def run_loop(self) -> None:
-        # Create the asyncio.Event here, inside the correct running event loop.
         self.stop_event = asyncio.Event()
 
-        # Bridge: poll the threading.Event and set the asyncio one when triggered.
         async def _stop_watcher():
             while not self._stop_flag.is_set():
                 await asyncio.sleep(0.25)
@@ -439,9 +542,10 @@ class WorkerEngine:
         self.prod_task = asyncio.create_task(self._producer(queue, seen_ids))
         watcher_task = asyncio.create_task(_stop_watcher())
 
-        # Completely safe wait block
         await self.stop_event.wait()
-        self.ui["log"]("Initiating shutdown...")
+        
+        if not self._is_updating:
+            self.ui["log"]("Initiating shutdown...")
 
         watcher_task.cancel()
         if self.prod_task:
@@ -451,7 +555,9 @@ class WorkerEngine:
 
         tasks = self.active_tasks + ([self.prod_task] if self.prod_task else [])
         await asyncio.gather(*tasks, return_exceptions=True)
-        self.ui["log"]("Worker stopped cleanly.")
+        
+        if not self._is_updating:
+            self.ui["log"]("Worker stopped cleanly.")
 
     async def _recover_interrupted_jobs(self, queue: asyncio.Queue, seen_ids: collections.deque) -> None:
         tmp = Path(self.cfg["temp_dir"])
@@ -466,7 +572,7 @@ class WorkerEngine:
                         queue.put_nowait(cached)
                         recovered += 1
                     except asyncio.QueueFull:
-                        pass  # workers will pick up remaining jobs via the producer
+                        pass
             except Exception:
                 pass
         if recovered: self.ui["log"](f"Recovered {recovered} interrupted job(s). Resuming…")
@@ -482,6 +588,10 @@ class WorkerEngine:
                         f"{self.cfg['api_server']}/api/jobs",
                         params={"count": self.cfg["batch_size"]}, headers=self.headers,
                     )
+                    if resp.status_code == 426:
+                        asyncio.create_task(self._auto_update())
+                        break
+                        
                     if resp.status_code == 200:
                         jobs = resp.json().get("jobs", [])
                         for job in jobs:
