@@ -11,11 +11,12 @@ import webbrowser
 import time
 import secrets
 import hashlib
+import concurrent.futures
 from pathlib import Path
 import httpx
 
 # --- Config & Globals ---
-VERSION = "1.2.10-complete"
+VERSION = "1.3.0-performance"
 SERVER_URL = "https://api.minerva-archive.org"
 UPLOAD_SERVER_URL = "https://gate.minerva-archive.org"
 TOKEN_FILE = Path.home() / ".minerva-dpn" / "token"
@@ -23,12 +24,11 @@ TEMP_DIR = Path.home() / ".minerva-dpn" / "tmp"
 
 # Upload Constants
 UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024 
-UPLOAD_START_RETRIES = 12
-UPLOAD_CHUNK_RETRIES = 30
-UPLOAD_FINISH_RETRIES = 12
+UPLOAD_START_RETRIES = 5 # Reduced to fail faster
+UPLOAD_CHUNK_RETRIES = 10
+UPLOAD_FINISH_RETRIES = 5
 RETRIABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
 
-# Regex to catch: [Downloaded]/[Total](Percent%) DL:[Speed] ETA:[Time]
 ARIA_PROGRESS_REGEX = re.compile(r"\[#\w+\s+([^/]+)/([^\(]+)\((\d+)%\).*?DL:([^\s\]]+)(?:\s+ETA:([^\]]+))?")
 
 ctk.set_appearance_mode("dark")
@@ -36,12 +36,11 @@ ctk.set_default_color_theme("dark-blue")
 
 # --- Security & Utils ---
 def secure_filename(filename: str) -> str:
-    """Prevents Path Traversal and removes illegal characters."""
     filename = os.path.basename(urllib.parse.unquote(filename))
     filename = re.sub(r'[^a-zA-Z0-9_\-\.\(\)\s\[\]]', '_', filename)
     return filename.strip() or "unnamed_file.bin"
 
-def _retry_sleep(attempt: int, cap: float = 25.0) -> float:
+def _retry_sleep(attempt: int, cap: float = 15.0) -> float:
     return min(cap, (0.85 * attempt) + random.random() * 1.25)
 
 # --- Custom Widgets ---
@@ -142,7 +141,7 @@ class WorkerEngine:
         self.aria2c_path = shutil.which("aria2c")
 
     async def report_job(self, file_id, status, bytes_downloaded=None, error=None):
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             try:
                 await client.post(
                     f"{self.cfg['api_server']}/api/jobs/report",
@@ -184,31 +183,46 @@ class WorkerEngine:
         return dest
 
     async def upload_file(self, file_id, path: Path, ui_job_id):
-        timeout = httpx.Timeout(connect=30, read=300, write=300, pool=30)
+        # Shorter connection timeout so it doesn't hang forever silently
+        timeout = httpx.Timeout(connect=15, read=120, write=120, pool=30)
         async with httpx.AsyncClient(timeout=timeout) as client:
+            
             # 1. Start Session
             session_id = None
+            self.ui['log'](f"[{path.name}] Requesting upload session from {self.cfg['upload_server']}...")
             for attempt in range(1, UPLOAD_START_RETRIES + 1):
                 try:
                     resp = await client.post(f"{self.cfg['upload_server']}/api/upload/{file_id}/start", headers=self.headers)
                     if resp.status_code in RETRIABLE_STATUS_CODES:
+                        self.ui['log'](f"[{path.name}] Upload server busy (HTTP {resp.status_code}). Retrying {attempt}/{UPLOAD_START_RETRIES}...")
                         await asyncio.sleep(_retry_sleep(attempt))
                         continue
                     resp.raise_for_status()
                     session_id = resp.json()["session_id"]
                     break
-                except httpx.HTTPError:
+                except httpx.HTTPError as e:
+                    self.ui['log'](f"[{path.name}] Upload connection error: {e}")
                     await asyncio.sleep(_retry_sleep(attempt))
-            if not session_id: raise RuntimeError("Failed to create upload session")
+            
+            if not session_id: raise RuntimeError("Failed to connect to Upload Server after retries.")
 
             # 2. Send Chunks
             file_size = path.stat().st_size
             sent = 0
             hasher = hashlib.sha256()
+            start_time = time.time()
+            
+            self.ui['log'](f"[{path.name}] Upload session acquired. Sending data...")
+
+            # Using thread pool for blocking file I/O to keep network fast
+            loop = asyncio.get_running_loop()
+            
             with open(path, "rb") as f:
                 while True:
-                    data = f.read(UPLOAD_CHUNK_SIZE)
+                    # Offload hard drive read to a background CPU thread
+                    data = await loop.run_in_executor(None, f.read, UPLOAD_CHUNK_SIZE)
                     if not data: break
+                    
                     hasher.update(data)
                     for attempt in range(1, UPLOAD_CHUNK_RETRIES + 1):
                         try:
@@ -225,16 +239,25 @@ class WorkerEngine:
                             break
                         except httpx.HTTPError:
                             await asyncio.sleep(_retry_sleep(attempt, cap=20.0))
+                            
                     sent += len(data)
                     
-                    # Update GUI
+                    # Upload Telemetry & ETA Math
+                    elapsed = time.time() - start_time
+                    speed_bps = sent / elapsed if elapsed > 0 else 0
+                    speed_mbs = speed_bps / (1024 * 1024)
+                    
+                    eta_sec = (file_size - sent) / speed_bps if speed_bps > 0 else 0
+                    eta_m, eta_s = divmod(int(eta_sec), 60)
+                    
                     pct = sent / file_size if file_size > 0 else 1.0
                     self.ui['progress'](
-                        ui_job_id, pct, "↑ Uploading", "Uploading", 
-                        f"{sent/1024/1024:.1f}MB / {file_size/1024/1024:.1f}MB", "ETA: ..."
+                        ui_job_id, pct, f"↑ {speed_mbs:.1f} MB/s", "Uploading", 
+                        f"{sent/1024/1024:.1f}MB / {file_size/1024/1024:.1f}MB", f"ETA: {eta_m}m {eta_s}s"
                     )
 
             # 3. Finish
+            self.ui['log'](f"[{path.name}] Upload stream finished. Verifying checksum...")
             expected_sha256 = hasher.hexdigest()
             for attempt in range(1, UPLOAD_FINISH_RETRIES + 1):
                 try:
@@ -270,10 +293,10 @@ class WorkerEngine:
             
             file_size = local_path.stat().st_size if local_path.exists() else 0
             
-            self.ui['progress'](ui_job_id, 0.0, "Starting Upload...", "Uploading", "Preparing...", "ETA: --")
+            self.ui['progress'](ui_job_id, 0.0, "↑ 0.0 MB/s", "Uploading", "Connecting to server...", "ETA: --")
             await self.upload_file(file_id, local_path, ui_job_id)
             
-            self.ui['progress'](ui_job_id, 1.0, "Complete", "Complete", "Upload Finished", "ETA: Done")
+            self.ui['progress'](ui_job_id, 1.0, "Complete", "Complete", "Upload Verified", "ETA: Done")
             self.ui['log'](f"Successfully processed: {clean_filename}")
             await self.report_job(file_id, "completed", bytes_downloaded=file_size)
 
@@ -321,7 +344,7 @@ class WorkerEngine:
                 except asyncio.CancelledError:
                     break
 
-        self.ui['log'](f"Worker engine started with {self.cfg['concurrency']} concurrent slots.")
+        self.ui['log'](f"Worker engine started. CPU Cores available: {os.cpu_count()}")
         prod_task = asyncio.create_task(producer())
         work_tasks = [asyncio.create_task(worker()) for _ in range(self.cfg['concurrency'])]
         
@@ -561,8 +584,14 @@ class MinervaApp(ctk.CTk):
 
         self.worker_engine = WorkerEngine(config, callbacks)
         
+        # Unlock CPU Threading for background file reads
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() * 4)
+        loop.set_default_executor(executor)
+        
         def _run_async():
-            asyncio.run(self.worker_engine.run_loop())
+            loop.run_until_complete(self.worker_engine.run_loop())
             self.after(0, self._on_worker_stopped)
             
         self.worker_thread = threading.Thread(target=_run_async, daemon=True)
