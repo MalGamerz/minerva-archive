@@ -3,11 +3,11 @@ name: Build Executables
 on:
   push:
     branches: ["main"]
-  pull_request:
-    branches: ["main"]
+  # This adds a manual "Run workflow" button to your GitHub Actions tab
+  workflow_dispatch: 
 
 permissions:
-  contents: read
+  contents: write 
 
 jobs:
   build:
@@ -15,7 +15,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── Windows: GUI exe ──────────────────────────
           - os: windows-latest
             name: Windows-GUI
             artifact: MinervaWorker-Windows
@@ -24,7 +23,6 @@ jobs:
               --collect-all customtkinter
             extra_deps: ".[gui]"
 
-          # ── Linux Headless / Server ─────────────────────────
           - os: ubuntu-latest
             name: Linux-Headless
             artifact: MinervaWorker-Linux-Headless
@@ -42,6 +40,14 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.11"
+
+      # AUTOMATION: Extract the version directly from pyproject.toml
+      - name: Extract Version
+        id: extract_version
+        shell: bash
+        run: |
+          VERSION=$(grep -oP '(?<=version = ")[^"]*' pyproject.toml)
+          echo "APP_VERSION=v$VERSION" >> $GITHUB_ENV
 
       - name: Install Python deps
         run: |
@@ -76,4 +82,15 @@ jobs:
             dist/${{ matrix.artifact }}.exe
             dist/${{ matrix.artifact }}
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
+          
+      # PUBLISH: Only create a release if you clicked the manual button
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          tag_name: ${{ env.APP_VERSION }}
+          name: Release ${{ env.APP_VERSION }}
+          files: |
+            dist/${{ matrix.artifact }}.exe
+            dist/${{ matrix.artifact }}
