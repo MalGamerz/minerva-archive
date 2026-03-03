@@ -1,4 +1,4 @@
-name: Build MinervaWorker Windows Executable
+name: Build Dual-Target Executables
 
 on:
   push:
@@ -10,32 +10,56 @@ permissions:
   contents: read
 
 jobs:
-  build-windows:
+  build-windows-gui:
     runs-on: windows-latest
-
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Set up Python 3.10
-      uses: actions/setup-python@v5
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v5
       with:
         python-version: "3.10"
-        cache: 'pip' # Speeds up future builds
 
-    - name: Install dependencies
+    - name: Install Dependencies
       run: |
-        python -m pip install --upgrade pip
-        pip install pyinstaller
-        pip install -r requirements.txt
+        uv pip install pyinstaller
+        uv pip install -e .[gui]
 
-    - name: Build with PyInstaller
+    - name: Build Windows GUI Executable
       run: |
-        pyinstaller --noconfirm --onefile --windowed --name "MinervaWorker" --collect-all customtkinter "main.py"
+        uv run pyinstaller --noconfirm --onefile --windowed --name "MinervaWorker-GUI-Win" --collect-all customtkinter "main_gui.py"
 
-    - name: Upload Executable Artifact
+    - name: Upload Windows Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: MinervaWorker-Windows-EXE
-        path: dist/MinervaWorker.exe
+        name: MinervaWorker-GUI-Windows
+        path: dist/MinervaWorker-GUI-Win.exe
+        retention-days: 7
+
+  build-linux-headless:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v5
+      with:
+        python-version: "3.10"
+
+    - name: Install Dependencies
+      run: |
+        uv pip install pyinstaller
+        uv pip install -e .
+
+    - name: Build Linux CLI Executable
+      run: |
+        uv run pyinstaller --noconfirm --onefile --name "MinervaWorker-CLI-Linux" "main_cli.py"
+
+    - name: Upload Linux Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: MinervaWorker-CLI-Linux
+        path: dist/MinervaWorker-CLI-Linux
         retention-days: 7
