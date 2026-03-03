@@ -1,17 +1,79 @@
-[project]
-name = "minerva-archive"
-version = "1.3.2"
-description = "High-performance DPN Worker for the Minerva Archive"
-readme = "README.md"
-requires-python = ">=3.10"
-dependencies = [
-    "httpx>=0.27.0",
-]
+name: Build Executables
 
-[project.optional-dependencies]
-gui = [
-    "customtkinter>=5.2.2",
-]
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
 
-[tool.setuptools]
-py-modules = ["main", "engine", "config", "auth", "utils"]
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Windows: GUI exe ──────────────────────────
+          - os: windows-latest
+            name: Windows-GUI
+            artifact: MinervaWorker-Windows
+            pyinstaller_flags: >-
+              --windowed
+              --collect-all customtkinter
+            extra_deps: ".[gui]"
+
+          # ── Linux Headless / Server ─────────────────────────
+          - os: ubuntu-latest
+            name: Linux-Headless
+            artifact: MinervaWorker-Linux-Headless
+            pyinstaller_flags: ""
+            extra_deps: "."
+
+    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          uv pip install pyinstaller
+          uv pip install -e "${{ matrix.extra_deps }}"
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          uv run pyinstaller \
+            --noconfirm \
+            --onefile \
+            --name "${{ matrix.artifact }}" \
+            ${{ matrix.pyinstaller_flags }} \
+            main.py
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          uv run pyinstaller `
+            --noconfirm `
+            --onefile `
+            --name "${{ matrix.artifact }}" `
+            ${{ matrix.pyinstaller_flags }} `
+            main.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/${{ matrix.artifact }}.exe
+            dist/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 7
