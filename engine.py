@@ -167,6 +167,11 @@ class WorkerEngine:
                     f"{self.cfg['upload_server']}/api/upload/{file_id}/start",
                     headers=self.headers,
                 )
+                
+                # Instantly catch a 409 Conflict and abort
+                if resp.status_code == 409:
+                    raise FileExistsError("409_CONFLICT")
+
                 if resp.status_code in RETRIABLE_STATUS_CODES:
                     self.ui["log"](
                         f"[{path.name}] Upload server busy (HTTP {resp.status_code})."
@@ -176,6 +181,8 @@ class WorkerEngine:
                     continue
                 resp.raise_for_status()
                 return resp.json()["session_id"]
+            except FileExistsError:
+                raise # Pass it up immediately to the job processor
             except httpx.HTTPError as exc:
                 self.ui["log"](f"[{path.name}] Upload connection error: {exc}")
                 await asyncio.sleep(_retry_sleep(attempt))
@@ -218,11 +225,18 @@ class WorkerEngine:
                             },
                             content=data,
                         )
+                        
+                        # Catch 409 Conflict mid-upload if another worker finishes first
+                        if resp.status_code == 409:
+                            raise FileExistsError("409_CONFLICT")
+
                         if resp.status_code in RETRIABLE_STATUS_CODES:
                             await asyncio.sleep(_retry_sleep(attempt, cap=20.0))
                             continue
                         resp.raise_for_status()
                         break  # chunk sent successfully
+                    except FileExistsError:
+                        raise
                     except httpx.HTTPError:
                         if attempt == UPLOAD_CHUNK_RETRIES:
                             raise RuntimeError(
@@ -248,18 +262,11 @@ class WorkerEngine:
                     f"ETA: {eta_m}m {eta_s}s",
                 )
 
-        # Stash digest on the hasher so _upload_finish can access it via the
-        # return value without needing an instance variable.
         return hasher.hexdigest()
 
     async def _upload_finish(
         self, client: httpx.AsyncClient, file_id, path: Path, session_id: str
     ) -> None:
-        # Re-hash is avoided by returning the digest from _upload_chunks; but
-        # since we need it here, we recalculate only if this method is ever
-        # called independently. In normal flow the checksum is passed in.
-        # ── For simplicity we re-open & hash here only as a fallback ──
-        # The cleaner solution: refactor to pass the digest as a parameter.
         hasher = hashlib.sha256()
         loop = asyncio.get_running_loop()
         with open(path, "rb") as fh:
@@ -276,11 +283,18 @@ class WorkerEngine:
                     params={"session_id": session_id, "expected_sha256": expected_sha256},
                     headers=self.headers,
                 )
+                
+                # Catch 409 Conflict right at the finish line
+                if resp.status_code == 409:
+                    raise FileExistsError("409_CONFLICT")
+
                 if resp.status_code in RETRIABLE_STATUS_CODES:
                     await asyncio.sleep(_retry_sleep(attempt, cap=20.0))
                     continue
                 resp.raise_for_status()
                 return
+            except FileExistsError:
+                raise
             except httpx.HTTPError:
                 if attempt == UPLOAD_FINISH_RETRIES:
                     raise RuntimeError("Failed to finalise upload after retries.")
@@ -331,6 +345,11 @@ class WorkerEngine:
         except asyncio.CancelledError:
             # Let the cancellation propagate so run_loop shuts down cleanly.
             raise
+        except FileExistsError:
+            # Handle the 409 cleanly without logging it as a scary error
+            self.ui["log"](f"[{clean_filename}] Skipped: Server returned 409 Conflict (Already archived by another worker).")
+            self.ui["progress"](ui_job_id, 1.0, "Skipped", "Skipped", "Already Archived", "ETA: Done")
+            await self.report_job(file_id, "failed", error="409 Conflict")
         except Exception as exc:
             safe_error = self._redact(str(exc))
             self.ui["log"](f"Error on {clean_filename}: {safe_error}")
