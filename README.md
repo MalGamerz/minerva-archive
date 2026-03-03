@@ -23,33 +23,37 @@ Built from the ground up for high-bandwidth connections, this version features a
 
 You have two ways to run the Minerva Unofficial GUI: downloading the standalone executable, or running it from source via Python.
 
-### Option 1: The Standalone App (Windows Only)
+### Option 1: The Standalone App (Windows & Linux)
 
 You do not need to install Python to run the app using this method.
 
-1. Download the latest `MinervaWorker.exe` from the **Releases** tab.
+1. Download the latest release from the **Releases** tab:
+   - **Windows:** `MinervaWorker-Windows.exe` — full GUI with dark-mode interface
+   - **Linux:** `MinervaWorker-Linux-Headless` — headless CLI worker
 2. Ensure `aria2c` is installed on your system (see Step 3 below).
-3. Double-click the `.exe` to launch.
+3. **Windows:** Double-click the `.exe` to launch.
+   **Linux:** Make the binary executable and run it:
+   ```bash
+   chmod +x MinervaWorker-Linux-Headless
+   ./MinervaWorker-Linux-Headless --cli --run
+   ```
 
 ### Option 2: Running from Source
 
-If you are on macOS/Linux or want to run the raw Python code:
+If you want to run the raw Python code or use the GUI on Linux/macOS:
 
 1. Ensure you have **Python 3.10+** installed.
 2. Clone this repository and install the dependencies:
 ```cmd
 pip install -r requirements.txt
-
 ```
-
 
 3. Launch the app:
 ```cmd
 python main.py
-
 ```
 
-
+> **GUI on Linux/macOS:** The app will automatically launch in GUI mode if a display is detected, or fall back to CLI mode if running headless. To force a mode explicitly, use `python main.py --gui` or `python main.py --cli`.
 
 ### Step 3: Install `aria2c` (REQUIRED for maximum speed)
 
@@ -74,6 +78,15 @@ Use the settings grid in the UI to optimize your worker. **Ensure that `[Concurr
 **The Machine Gun Setup (For tiny retro ROMs):**
 * Concurrency: `15` | aria2c Connections: `1`
 * *Result:* You pull 15 different small games simultaneously.
+
+---
+
+## 🐛 Changelog
+
+### v2.0.0
+* **Fix:** Start Worker button remaining permanently disabled after stopping the worker. The engine's `asyncio.Event` was being created on the GUI thread rather than inside the worker's event loop, causing the stop signal to never be received and the worker thread to never exit.
+* **Fix:** Worker thread completing but UI never updating — the GUI monitor was firing before the thread had started, causing it to immediately conclude the worker had stopped.
+* **Fix:** Potential deadlock on startup when stale `.job.json` files were present in the temp directory, caused by `queue.put()` blocking on a full queue before the worker tasks had been started.
 
 ---
 
