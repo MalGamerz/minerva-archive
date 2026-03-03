@@ -9,22 +9,40 @@ import re
 import http.server
 import webbrowser
 import time
+import secrets
+import hashlib
 from pathlib import Path
 import httpx
 
 # --- Config & Globals ---
-VERSION = "1.2.8-ETA"
+VERSION = "1.2.10-complete"
 SERVER_URL = "https://api.minerva-archive.org"
 UPLOAD_SERVER_URL = "https://gate.minerva-archive.org"
 TOKEN_FILE = Path.home() / ".minerva-dpn" / "token"
-MAX_RETRIES = 3
+TEMP_DIR = Path.home() / ".minerva-dpn" / "tmp"
 
-# UPDATED: Advanced Regex to catch Downloaded, Total, Percent, Speed, AND ETA
-# Example: [#92cc61 22MiB/25MiB(86%) CN:1 DL:578KiB ETA:5s]
+# Upload Constants
+UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024 
+UPLOAD_START_RETRIES = 12
+UPLOAD_CHUNK_RETRIES = 30
+UPLOAD_FINISH_RETRIES = 12
+RETRIABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+
+# Regex to catch: [Downloaded]/[Total](Percent%) DL:[Speed] ETA:[Time]
 ARIA_PROGRESS_REGEX = re.compile(r"\[#\w+\s+([^/]+)/([^\(]+)\((\d+)%\).*?DL:([^\s\]]+)(?:\s+ETA:([^\]]+))?")
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
+
+# --- Security & Utils ---
+def secure_filename(filename: str) -> str:
+    """Prevents Path Traversal and removes illegal characters."""
+    filename = os.path.basename(urllib.parse.unquote(filename))
+    filename = re.sub(r'[^a-zA-Z0-9_\-\.\(\)\s\[\]]', '_', filename)
+    return filename.strip() or "unnamed_file.bin"
+
+def _retry_sleep(attempt: int, cap: float = 25.0) -> float:
+    return min(cap, (0.85 * attempt) + random.random() * 1.25)
 
 # --- Custom Widgets ---
 class CustomSpinbox(ctk.CTkFrame):
@@ -56,19 +74,36 @@ class MinervaAuth:
     @staticmethod
     def load_token():
         if TOKEN_FILE.exists():
-            t = TOKEN_FILE.read_text().strip()
-            return t if t else None
+            return TOKEN_FILE.read_text().strip() or None
         return None
+
+    @staticmethod
+    def delete_token():
+        if TOKEN_FILE.exists():
+            TOKEN_FILE.unlink()
 
     @staticmethod
     def do_login(server_url, log_callback):
         token = None
         event = threading.Event()
+        oauth_state = secrets.token_urlsafe(16)
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
+                if self.client_address[0] != '127.0.0.1':
+                    self.send_error(403, "Forbidden")
+                    return
+
                 nonlocal token
                 params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                
+                if params.get("state", [""])[0] != oauth_state:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"<h1>Error: Invalid State (CSRF Protection)</h1>")
+                    event.set()
+                    return
+
                 if "token" in params:
                     token = params["token"][0]
                     self.send_response(200)
@@ -82,8 +117,8 @@ class MinervaAuth:
             def log_message(self, *a): pass
 
         srv = http.server.HTTPServer(("127.0.0.1", 19283), Handler)
-        url = f"{server_url}/auth/discord/login?worker_callback=http://127.0.0.1:19283/"
-        log_callback(f"Opening browser for login...\nIf it fails, go to: {url}")
+        url = f"{server_url}/auth/discord/login?worker_callback=http://127.0.0.1:19283/&state={oauth_state}"
+        log_callback("Opening browser for secure login...")
         webbrowser.open(url)
         
         while not event.is_set():
@@ -93,7 +128,9 @@ class MinervaAuth:
         if token:
             TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
             TOKEN_FILE.write_text(token)
-            log_callback("Login successful!")
+            try: os.chmod(TOKEN_FILE, 0o600)
+            except Exception: pass 
+            log_callback("Login successful. Token secured.")
         return token
 
 class WorkerEngine:
@@ -102,27 +139,29 @@ class WorkerEngine:
         self.ui = ui_callbacks 
         self.stop_event = asyncio.Event()
         self.headers = {"Authorization": f"Bearer {config['token']}", "X-Minerva-Worker-Version": VERSION}
-        self.has_aria2c = shutil.which("aria2c") is not None
+        self.aria2c_path = shutil.which("aria2c")
 
     async def report_job(self, file_id, status, bytes_downloaded=None, error=None):
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             try:
                 await client.post(
                     f"{self.cfg['api_server']}/api/jobs/report",
                     headers=self.headers,
                     json={"file_id": file_id, "status": status, "bytes_downloaded": bytes_downloaded, "error": error}
                 )
-            except Exception:
+            except httpx.RequestError:
                 pass
 
     async def download_file(self, url, dest, known_size, ui_job_id):
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if self.has_aria2c:
+        if self.aria2c_path:
             proc = await asyncio.create_subprocess_exec(
-                "aria2c", f"--max-connection-per-server={self.cfg['aria_conns']}",
+                self.aria2c_path, 
+                f"--max-connection-per-server={self.cfg['aria_conns']}",
                 f"--split={self.cfg['aria_conns']}", "--min-split-size=1M",
                 "--dir", str(dest.parent), "--out", dest.name,
-                "--console-log-level=notice", "--summary-interval=1", "--allow-overwrite=true", url,
+                "--console-log-level=notice", "--summary-interval=1", "--allow-overwrite=true", 
+                url,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
             )
             while True:
@@ -132,35 +171,98 @@ class WorkerEngine:
                 line_str = line.decode('utf-8', errors='replace')
                 match = ARIA_PROGRESS_REGEX.search(line_str)
                 if match:
-                    downloaded = match.group(1).strip()
-                    total_size = match.group(2).strip()
-                    pct = int(match.group(3)) / 100.0
-                    speed = match.group(4).strip()
-                    eta = match.group(5).strip() if match.group(5) else "Calculating..."
-                    
                     self.ui['progress'](
                         ui_job_id, 
-                        pct, 
-                        f"{speed}/s", 
-                        f"Downloading", 
-                        f"{downloaded} / {total_size}",
-                        f"ETA: {eta}"
+                        int(match.group(3)) / 100.0, 
+                        f"{match.group(4).strip()}/s", 
+                        "Downloading", 
+                        f"{match.group(1).strip()} / {match.group(2).strip()}",
+                        f"ETA: {match.group(5).strip() if match.group(5) else '...'}"
                     )
             await proc.wait()
             if proc.returncode != 0: raise RuntimeError(f"aria2c error {proc.returncode}")
         return dest
 
+    async def upload_file(self, file_id, path: Path, ui_job_id):
+        timeout = httpx.Timeout(connect=30, read=300, write=300, pool=30)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            # 1. Start Session
+            session_id = None
+            for attempt in range(1, UPLOAD_START_RETRIES + 1):
+                try:
+                    resp = await client.post(f"{self.cfg['upload_server']}/api/upload/{file_id}/start", headers=self.headers)
+                    if resp.status_code in RETRIABLE_STATUS_CODES:
+                        await asyncio.sleep(_retry_sleep(attempt))
+                        continue
+                    resp.raise_for_status()
+                    session_id = resp.json()["session_id"]
+                    break
+                except httpx.HTTPError:
+                    await asyncio.sleep(_retry_sleep(attempt))
+            if not session_id: raise RuntimeError("Failed to create upload session")
+
+            # 2. Send Chunks
+            file_size = path.stat().st_size
+            sent = 0
+            hasher = hashlib.sha256()
+            with open(path, "rb") as f:
+                while True:
+                    data = f.read(UPLOAD_CHUNK_SIZE)
+                    if not data: break
+                    hasher.update(data)
+                    for attempt in range(1, UPLOAD_CHUNK_RETRIES + 1):
+                        try:
+                            resp = await client.post(
+                                f"{self.cfg['upload_server']}/api/upload/{file_id}/chunk",
+                                params={"session_id": session_id},
+                                headers={**self.headers, "Content-Type": "application/octet-stream"},
+                                content=data,
+                            )
+                            if resp.status_code in RETRIABLE_STATUS_CODES:
+                                await asyncio.sleep(_retry_sleep(attempt, cap=20.0))
+                                continue
+                            resp.raise_for_status()
+                            break
+                        except httpx.HTTPError:
+                            await asyncio.sleep(_retry_sleep(attempt, cap=20.0))
+                    sent += len(data)
+                    
+                    # Update GUI
+                    pct = sent / file_size if file_size > 0 else 1.0
+                    self.ui['progress'](
+                        ui_job_id, pct, "↑ Uploading", "Uploading", 
+                        f"{sent/1024/1024:.1f}MB / {file_size/1024/1024:.1f}MB", "ETA: ..."
+                    )
+
+            # 3. Finish
+            expected_sha256 = hasher.hexdigest()
+            for attempt in range(1, UPLOAD_FINISH_RETRIES + 1):
+                try:
+                    resp = await client.post(
+                        f"{self.cfg['upload_server']}/api/upload/{file_id}/finish",
+                        params={"session_id": session_id, "expected_sha256": expected_sha256},
+                        headers=self.headers,
+                    )
+                    if resp.status_code in RETRIABLE_STATUS_CODES:
+                        await asyncio.sleep(_retry_sleep(attempt, cap=20.0))
+                        continue
+                    resp.raise_for_status()
+                    break
+                except httpx.HTTPError:
+                    await asyncio.sleep(_retry_sleep(attempt, cap=20.0))
+
     async def process_job(self, job):
-        file_id, url, dest_path = job["file_id"], job["url"], job["dest_path"]
+        file_id, url, raw_dest_path = job["file_id"], job["url"], job["dest_path"]
+        
         parsed = urllib.parse.urlparse(url)
         host = "".join("_" if ch in '<>:"/\\|?*' else ch for ch in (parsed.netloc or "unknown")).strip()
-        local_path = Path(self.cfg['temp_dir']) / host / Path(dest_path.lstrip("/"))
+        clean_filename = secure_filename(raw_dest_path)
         
-        clean_name = urllib.parse.unquote(dest_path.split("/")[-1])
-        ui_job_id = local_path.name
+        local_path = Path(self.cfg['temp_dir']).resolve() / host / clean_filename
+        ui_job_id = str(file_id) 
         
-        self.ui['log'](f"Starting job: {clean_name}")
-        self.ui['new_job'](ui_job_id, clean_name)
+        self.ui['log'](f"Starting job: {clean_filename}")
+        self.ui['new_job'](ui_job_id, clean_filename)
 
         try:
             await asyncio.sleep(random.uniform(1.0, 3.0))
@@ -168,17 +270,18 @@ class WorkerEngine:
             
             file_size = local_path.stat().st_size if local_path.exists() else 0
             
-            self.ui['progress'](ui_job_id, 1.0, "Processing...", "Uploading", "Verifying Hash...", "ETA: --")
-            await asyncio.sleep(2) # Mock upload time
+            self.ui['progress'](ui_job_id, 0.0, "Starting Upload...", "Uploading", "Preparing...", "ETA: --")
+            await self.upload_file(file_id, local_path, ui_job_id)
             
             self.ui['progress'](ui_job_id, 1.0, "Complete", "Complete", "Upload Finished", "ETA: Done")
-            self.ui['log'](f"Successfully processed: {clean_name}")
+            self.ui['log'](f"Successfully processed: {clean_filename}")
             await self.report_job(file_id, "completed", bytes_downloaded=file_size)
 
         except Exception as e:
-            self.ui['log'](f"Error on {clean_name}: {e}")
-            self.ui['progress'](ui_job_id, 0.0, "Failed", "Failed", str(e)[:40], "ETA: Error")
-            await self.report_job(file_id, "failed", error=str(e))
+            safe_error = str(e).replace(self.cfg['token'], "[REDACTED]") if self.cfg['token'] else str(e)
+            self.ui['log'](f"Error on {clean_filename}: {safe_error}")
+            self.ui['progress'](ui_job_id, 0.0, "Failed", "Failed", safe_error[:40], "ETA: Error")
+            await self.report_job(file_id, "failed", error=safe_error)
         finally:
             if not self.cfg['keep_files']:
                 local_path.unlink(missing_ok=True)
@@ -188,7 +291,7 @@ class WorkerEngine:
         seen_ids = set()
 
         async def producer():
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=10.0) as client:
                 while not self.stop_event.is_set():
                     if queue.qsize() >= self.cfg['concurrency']:
                         await asyncio.sleep(1)
@@ -206,7 +309,7 @@ class WorkerEngine:
                                     await queue.put(job)
                         else:
                             await asyncio.sleep(10)
-                    except Exception:
+                    except httpx.RequestError:
                         await asyncio.sleep(10)
 
         async def worker():
@@ -232,7 +335,7 @@ class WorkerEngine:
 class MinervaApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Minerva Archive — DPN Worker")
+        self.title("Minerva Archive — DPN Worker (Unofficial)")
         self.geometry("1050x650")
         self.minsize(950, 600)
         
@@ -247,15 +350,12 @@ class MinervaApp(ctk.CTk):
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
 
-        # ====================
-        # SIDEBAR
-        # ====================
         self.sidebar = ctk.CTkFrame(self, width=220, corner_radius=0, fg_color="#181818")
         self.sidebar.grid(row=0, column=0, sticky="nsew")
         self.sidebar.grid_rowconfigure(10, weight=1)
 
         ctk.CTkLabel(self.sidebar, text="MINERVA", font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=0, padx=20, pady=(30, 0))
-        ctk.CTkLabel(self.sidebar, text="DPN Worker", text_color="gray", font=ctk.CTkFont(size=12)).grid(row=1, column=0, padx=20, pady=(0, 20))
+        ctk.CTkLabel(self.sidebar, text="DPN Worker (Unofficial)", text_color="gray", font=ctk.CTkFont(size=11)).grid(row=1, column=0, padx=20, pady=(0, 20))
 
         self.status_btn = ctk.CTkButton(self.sidebar, text="🔴 Not Logged In", fg_color="#331E1E", text_color="#F44336", hover=False, height=28, corner_radius=14)
         self.status_btn.grid(row=2, column=0, padx=20, pady=(0, 30))
@@ -263,7 +363,8 @@ class MinervaApp(ctk.CTk):
         ctk.CTkLabel(self.sidebar, text="AUTHENTICATION", font=ctk.CTkFont(size=10, weight="bold"), text_color="gray").grid(row=3, column=0, padx=20, pady=(10, 5), sticky="w")
         self.login_btn = ctk.CTkButton(self.sidebar, text="Login with Discord", fg_color="#2B2B2B", hover_color="#3B3B3B", command=self.handle_login)
         self.login_btn.grid(row=4, column=0, padx=20, pady=5)
-        self.logout_btn = ctk.CTkButton(self.sidebar, text="Logout", fg_color="#2B2B2B", hover_color="#3B3B3B", state="disabled")
+        
+        self.logout_btn = ctk.CTkButton(self.sidebar, text="Logout & Delete Token", fg_color="#2B2B2B", hover_color="#8b1a1a", state="disabled", command=self.handle_logout)
         self.logout_btn.grid(row=5, column=0, padx=20, pady=5)
 
         ctk.CTkLabel(self.sidebar, text="WORKER", font=ctk.CTkFont(size=10, weight="bold"), text_color="gray").grid(row=6, column=0, padx=20, pady=(30, 5), sticky="w")
@@ -275,9 +376,6 @@ class MinervaApp(ctk.CTk):
         self.run_status = ctk.CTkLabel(self.sidebar, text="⚪ Stopped", text_color="gray", font=ctk.CTkFont(size=12))
         self.run_status.grid(row=9, column=0, pady=(10, 0))
 
-        # ====================
-        # MAIN AREA
-        # ====================
         self.main_frame = ctk.CTkFrame(self, fg_color="#0A0A0A", corner_radius=0)
         self.main_frame.grid(row=0, column=1, sticky="nsew", padx=0, pady=0)
         
@@ -286,7 +384,6 @@ class MinervaApp(ctk.CTk):
         self.main_frame.grid_rowconfigure(2, weight=1)
         self.main_frame.grid_columnconfigure(0, weight=1)
 
-        # --- Settings Header ---
         self.settings_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
         self.settings_frame.grid(row=0, column=0, sticky="ew", padx=20, pady=20)
         self.settings_frame.grid_columnconfigure((0, 1, 2), weight=1)
@@ -298,7 +395,6 @@ class MinervaApp(ctk.CTk):
         self.v_temp = ctk.StringVar(value=str(TEMP_DIR))
         self.v_keep = ctk.BooleanVar(value=False)
 
-        # Col 1
         col1 = ctk.CTkFrame(self.settings_frame, fg_color="transparent")
         col1.grid(row=0, column=0, sticky="nw", padx=10)
         ctk.CTkLabel(col1, text="SERVERS", font=ctk.CTkFont(size=11, weight="bold"), text_color="gray").pack(anchor="w", pady=(0, 10))
@@ -307,7 +403,6 @@ class MinervaApp(ctk.CTk):
         ctk.CTkLabel(col1, text="Upload Server", font=ctk.CTkFont(size=12)).pack(anchor="w")
         ctk.CTkEntry(col1, textvariable=self.v_upload, width=250, fg_color="#181818", border_color="#333").pack(anchor="w")
 
-        # Col 2
         col2 = ctk.CTkFrame(self.settings_frame, fg_color="transparent")
         col2.grid(row=0, column=1, sticky="nw", padx=10)
         ctk.CTkLabel(col2, text="PERFORMANCE", font=ctk.CTkFont(size=11, weight="bold"), text_color="gray").pack(anchor="w", pady=(0, 10))
@@ -316,7 +411,6 @@ class MinervaApp(ctk.CTk):
         ctk.CTkLabel(col2, text="aria2c Connections", font=ctk.CTkFont(size=12)).pack(anchor="w")
         CustomSpinbox(col2, textvariable=self.v_aria, width=120).pack(anchor="w")
 
-        # Col 3
         col3 = ctk.CTkFrame(self.settings_frame, fg_color="transparent")
         col3.grid(row=0, column=2, sticky="nw", padx=10)
         ctk.CTkLabel(col3, text="STORAGE", font=ctk.CTkFont(size=11, weight="bold"), text_color="gray").pack(anchor="w", pady=(0, 10))
@@ -324,11 +418,9 @@ class MinervaApp(ctk.CTk):
         ctk.CTkEntry(col3, textvariable=self.v_temp, width=250, fg_color="#181818", border_color="#333").pack(anchor="w", pady=(0, 15))
         ctk.CTkCheckBox(col3, text="Keep files after upload", variable=self.v_keep, fg_color="#991b1b", hover_color="#7f1d1d").pack(anchor="w", pady=5)
 
-        # --- Divider ---
         divider = ctk.CTkFrame(self.main_frame, height=2, fg_color="#222222")
         divider.grid(row=1, column=0, sticky="ew")
 
-        # --- Tabs ---
         self.tabview = ctk.CTkTabview(self.main_frame, fg_color="transparent", segmented_button_selected_color="#333", segmented_button_selected_hover_color="#444")
         self.tabview.grid(row=2, column=0, padx=20, pady=10, sticky="nsew")
 
@@ -351,7 +443,10 @@ class MinervaApp(ctk.CTk):
             self.logout_btn.configure(state="normal")
             self.start_btn.configure(state="normal", fg_color="#1E3320", hover_color="#2E4A31")
         else:
-            self.start_btn.configure(state="disabled")
+            self.status_btn.configure(text="🔴 Not Logged In", fg_color="#331E1E", text_color="#F44336")
+            self.login_btn.configure(state="normal")
+            self.logout_btn.configure(state="disabled")
+            self.start_btn.configure(state="disabled", fg_color="#2B2B2B")
 
     def log_safe(self, msg):
         def _log():
@@ -369,6 +464,14 @@ class MinervaApp(ctk.CTk):
                 self.after(0, self.update_auth_ui)
         threading.Thread(target=_login_thread, daemon=True).start()
 
+    def handle_logout(self):
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.stop_worker()
+        MinervaAuth.delete_token()
+        self.token = None
+        self.log_safe("Credentials explicitly revoked and deleted from disk.")
+        self.update_auth_ui()
+
     def job_new_safe(self, ui_job_id, clean_name):
         def _create():
             if ui_job_id in self.job_frames: return
@@ -377,7 +480,6 @@ class MinervaApp(ctk.CTk):
             frame.pack(fill="x", pady=8, padx=5)
             frame.grid_columnconfigure(0, weight=1)
             
-            # Top row
             top_container = ctk.CTkFrame(frame, fg_color="transparent")
             top_container.pack(fill="x", padx=15, pady=(12, 5))
             
@@ -390,12 +492,10 @@ class MinervaApp(ctk.CTk):
             stat_lbl = ctk.CTkLabel(top_container, text="Preparing...", text_color="#AAAAAA", font=ctk.CTkFont(size=12))
             stat_lbl.pack(side="right")
             
-            # Middle Bar
             bar = ctk.CTkProgressBar(frame, progress_color="#b22222", fg_color="#333333", height=6)
             bar.pack(fill="x", padx=15, pady=(0, 8))
             bar.set(0)
             
-            # Bottom row (Size & ETA)
             bottom_container = ctk.CTkFrame(frame, fg_color="transparent")
             bottom_container.pack(fill="x", padx=15, pady=(0, 10))
 
@@ -445,6 +545,7 @@ class MinervaApp(ctk.CTk):
         config = {
             "token": self.token,
             "api_server": self.v_api.get(),
+            "upload_server": self.v_upload.get(),
             "concurrency": int(self.v_conc.get()),
             "aria_conns": int(self.v_aria.get()),
             "batch_size": 10,
