@@ -1,65 +1,120 @@
-name: Build Dual-Target Executables
+name: Build Executables
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 permissions:
   contents: read
 
 jobs:
-  build-windows-gui:
-    runs-on: windows-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Windows: GUI exe (no console window) ──────────────────────────
+          - os: windows-latest
+            name: Windows-GUI
+            artifact: MinervaWorker-Windows.exe
+            pyinstaller_flags: >-
+              --windowed
+              --collect-all customtkinter
+            extra_deps: ".[gui]"
+
+          # ── macOS (Intel + Apple Silicon via universal2) ───────────────────
+          - os: macos-latest
+            name: macOS
+            artifact: MinervaWorker-macOS
+            pyinstaller_flags: >-
+              --windowed
+              --collect-all customtkinter
+              --target-arch universal2
+              --osx-bundle-identifier org.minerva-archive.worker
+            extra_deps: ".[gui]"
+
+          # ── Linux GUI (requires display — runnable on desktops) ───────────
+          - os: ubuntu-latest
+            name: Linux-GUI
+            artifact: MinervaWorker-Linux-GUI
+            pyinstaller_flags: >-
+              --collect-all customtkinter
+            extra_deps: ".[gui]"
+
+          # ── Linux headless / server (no GUI deps) ─────────────────────────
+          - os: ubuntu-latest
+            name: Linux-Headless
+            artifact: MinervaWorker-Linux-Headless
+            pyinstaller_flags: ""
+            extra_deps: "."
+
+    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.name }}
+
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Set up uv
-      uses: astral-sh/setup-uv@v5
-      with:
-        python-version: "3.10"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
 
-    - name: Install Dependencies
-      run: |
-        uv pip install pyinstaller
-        uv pip install -e .[gui]
+      # Linux GUI build needs Tk/Tcl headers and a virtual display
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            python3-tk tk-dev xvfb
 
-    - name: Build Windows GUI Executable
-      run: |
-        uv run pyinstaller --noconfirm --onefile --windowed --name "MinervaWorker-GUI-Win" --collect-all customtkinter "main_gui.py"
+      - name: Install Python deps
+        run: |
+          uv pip install pyinstaller
+          uv pip install -e "${{ matrix.extra_deps }}"
 
-    - name: Upload Windows Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: MinervaWorker-GUI-Windows
-        path: dist/MinervaWorker-GUI-Win.exe
-        retention-days: 7
+      # macOS: strip quarantine so the binary runs without Gatekeeper prompt
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          uv run pyinstaller \
+            --noconfirm \
+            --onefile \
+            --name "${{ matrix.artifact }}" \
+            ${{ matrix.pyinstaller_flags }} \
+            main.py
+          xattr -cr "dist/${{ matrix.artifact }}"
 
-  build-linux-headless:
-    runs-on: ubuntu-latest
-    steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+      # Linux GUI: wrap with xvfb so Tk/CTk imports don't crash at collect time
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          xvfb-run --auto-servernum uv run pyinstaller \
+            --noconfirm \
+            --onefile \
+            --name "${{ matrix.artifact }}" \
+            ${{ matrix.pyinstaller_flags }} \
+            main.py
 
-    - name: Set up uv
-      uses: astral-sh/setup-uv@v5
-      with:
-        python-version: "3.10"
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          uv run pyinstaller `
+            --noconfirm `
+            --onefile `
+            --name "${{ matrix.artifact }}" `
+            ${{ matrix.pyinstaller_flags }} `
+            main.py
 
-    - name: Install Dependencies
-      run: |
-        uv pip install pyinstaller
-        uv pip install -e .
-
-    - name: Build Linux CLI Executable
-      run: |
-        uv run pyinstaller --noconfirm --onefile --name "MinervaWorker-CLI-Linux" "main_cli.py"
-
-    - name: Upload Linux Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: MinervaWorker-CLI-Linux
-        path: dist/MinervaWorker-CLI-Linux
-        retention-days: 7
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          # Windows produces .exe, everything else has no extension
+          path: |
+            dist/${{ matrix.artifact }}.exe
+            dist/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 30
