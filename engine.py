@@ -12,6 +12,8 @@ import time
 import urllib.parse
 from pathlib import Path
 
+import threading
+
 import httpx
 
 from config import (
@@ -28,7 +30,11 @@ class WorkerEngine:
     def __init__(self, config: dict, ui_callbacks: dict):
         self.cfg = config
         self.ui = ui_callbacks
-        self.stop_event = asyncio.Event()
+        # asyncio.Event must be created inside the running event loop.
+        # Use a threading.Event as the cross-thread stop signal; run_loop()
+        # creates the asyncio.Event once it is actually running.
+        self._stop_flag = threading.Event()
+        self.stop_event: asyncio.Event | None = None
         self.headers = {
             "Authorization": f"Bearer {config['token']}",
             "X-Minerva-Worker-Version": VERSION,
@@ -40,6 +46,35 @@ class WorkerEngine:
             max_keepalive_connections=32,
             keepalive_expiry=30,
         )
+        
+        # Trackers for the OS-Level Nuclear Stop
+        self.active_tasks = []
+        self.active_procs = set()
+        self.prod_task = None
+
+    def force_stop(self) -> None:
+        """Signal stop via threading flag, then wake the asyncio event if available."""
+        self._stop_flag.set()
+        if self.stop_event is not None:
+            try:
+                self.stop_event.set()
+            except Exception:
+                pass
+        
+        # 1. Assassinate all running aria2c subprocesses at the OS level
+        for proc in list(self.active_procs):
+            try:
+                if proc.returncode is None:
+                    proc.kill()
+            except Exception:
+                pass
+                
+        # 2. Hard-cancel all asyncio worker tasks
+        for t in self.active_tasks:
+            t.cancel()
+            
+        if self.prod_task:
+            self.prod_task.cancel()
 
     def _redact(self, text: str) -> str:
         token = self.cfg.get("token") or ""
@@ -94,9 +129,13 @@ class WorkerEngine:
             kwargs["creationflags"] = 0x08000000 
 
         proc = await asyncio.create_subprocess_exec(*args, **kwargs)
+        self.active_procs.add(proc)
 
         try:
             async for raw in proc.stdout:
+                if self._stop_flag.is_set():
+                    raise asyncio.CancelledError()
+                    
                 line = raw.decode("utf-8", errors="replace")
                 m = ARIA_PROGRESS_REGEX.search(line)
                 if m:
@@ -113,14 +152,13 @@ class WorkerEngine:
             if proc.returncode != 0:
                 raise RuntimeError(f"aria2c exited with code {proc.returncode}")
                 
-        except asyncio.CancelledError:
-            # THIS IS THE FIX: Assassinate the zombie process when "Stop" is clicked
+        finally:
+            self.active_procs.discard(proc)
             if proc.returncode is None:
                 try:
                     proc.kill()
                 except OSError:
                     pass
-            raise
 
     async def _download_httpx(
         self, url: str, dest: Path, known_size: int, ui_job_id: str
@@ -148,7 +186,6 @@ class WorkerEngine:
     ) -> None:
         chunk_size = total // n
         ranges = [(i * chunk_size, (i + 1) * chunk_size - 1 if i < n - 1 else total - 1) for i in range(n)]
-
         tmp_parts = [dest.with_suffix(f".part{i}") for i in range(n)]
         downloaded_bytes = [0] * n
         start_time = time.monotonic()
@@ -156,14 +193,18 @@ class WorkerEngine:
         async def fetch_part(idx: int, start: int, end: int, out: Path) -> None:
             headers = {"Range": f"bytes={start}-{end}"}
             for attempt in range(10):
+                if self._stop_flag.is_set(): raise asyncio.CancelledError()
                 try:
                     async with client.stream("GET", url, headers=headers) as r:
                         r.raise_for_status()
                         with open(out, "wb") as fh:
                             async for chunk in r.aiter_bytes(65_536):
+                                if self._stop_flag.is_set(): raise asyncio.CancelledError()
                                 fh.write(chunk)
                                 downloaded_bytes[idx] += len(chunk)
                     return
+                except asyncio.CancelledError:
+                    raise
                 except Exception:
                     await asyncio.sleep(_retry_sleep(attempt + 1))
             raise RuntimeError(f"Part {idx} failed after retries")
@@ -172,6 +213,7 @@ class WorkerEngine:
 
         async def _report():
             while not all(t.done() for t in tasks):
+                if self._stop_flag.is_set(): break
                 done = sum(downloaded_bytes)
                 elapsed = time.monotonic() - start_time
                 speed = done / elapsed if elapsed > 0 else 0
@@ -190,16 +232,17 @@ class WorkerEngine:
         finally:
             reporter.cancel()
 
-        with open(dest, "wb") as out:
-            for part in tmp_parts:
-                with open(part, "rb") as inp:
-                    shutil.copyfileobj(inp, out)
-                part.unlink(missing_ok=True)
+        if not self._stop_flag.is_set():
+            with open(dest, "wb") as out:
+                for part in tmp_parts:
+                    with open(part, "rb") as inp:
+                        shutil.copyfileobj(inp, out)
+                    part.unlink(missing_ok=True)
 
-        self.ui["progress"](
-            ui_job_id, 1.0, "Done", "Downloading",
-            f"{total // 1_048_576} MB / {total // 1_048_576} MB", "ETA: 0s",
-        )
+            self.ui["progress"](
+                ui_job_id, 1.0, "Done", "Downloading",
+                f"{total // 1_048_576} MB / {total // 1_048_576} MB", "ETA: 0s",
+            )
 
     async def _download_httpx_stream(
         self, client: httpx.AsyncClient, url: str, dest: Path, total: int, ui_job_id: str,
@@ -212,6 +255,7 @@ class WorkerEngine:
             total = int(r.headers.get("content-length", total or 0))
             with open(dest, "wb") as fh:
                 async for chunk in r.aiter_bytes(65_536):
+                    if self._stop_flag.is_set(): raise asyncio.CancelledError()
                     fh.write(chunk)
                     downloaded += len(chunk)
                     now = time.monotonic()
@@ -237,6 +281,7 @@ class WorkerEngine:
     async def _upload_start(self, client: httpx.AsyncClient, file_id, path: Path) -> str:
         self.ui["log"](f"[{path.name}] Requesting upload session…")
         for attempt in range(1, UPLOAD_START_RETRIES + 1):
+            if self._stop_flag.is_set(): raise asyncio.CancelledError()
             try:
                 resp = await client.post(
                     f"{self.cfg['upload_server']}/api/upload/{file_id}/start", headers=self.headers,
@@ -247,7 +292,7 @@ class WorkerEngine:
                     continue
                 resp.raise_for_status()
                 return resp.json()["session_id"]
-            except FileExistsError: raise
+            except (FileExistsError, asyncio.CancelledError): raise
             except httpx.HTTPError as exc:
                 self.ui["log"](f"[{path.name}] Upload start error: {exc}")
                 await asyncio.sleep(_retry_sleep(attempt))
@@ -264,11 +309,13 @@ class WorkerEngine:
 
         with open(path, "rb") as fh:
             while True:
+                if self._stop_flag.is_set(): raise asyncio.CancelledError()
                 data = await loop.run_in_executor(None, fh.read, UPLOAD_CHUNK_SIZE)
                 if not data: break
                 hasher.update(data)
 
                 for attempt in range(1, UPLOAD_CHUNK_RETRIES + 1):
+                    if self._stop_flag.is_set(): raise asyncio.CancelledError()
                     try:
                         resp = await client.post(
                             f"{self.cfg['upload_server']}/api/upload/{file_id}/chunk",
@@ -282,7 +329,7 @@ class WorkerEngine:
                             continue
                         resp.raise_for_status()
                         break
-                    except FileExistsError: raise
+                    except (FileExistsError, asyncio.CancelledError): raise
                     except httpx.HTTPError:
                         if attempt == UPLOAD_CHUNK_RETRIES:
                             raise RuntimeError(f"Chunk upload failed after {UPLOAD_CHUNK_RETRIES} attempts.")
@@ -302,6 +349,7 @@ class WorkerEngine:
     async def _upload_finish(self, client: httpx.AsyncClient, file_id, path: Path, session_id: str, expected_sha256: str) -> None:
         self.ui["log"](f"[{path.name}] Verifying checksum…")
         for attempt in range(1, UPLOAD_FINISH_RETRIES + 1):
+            if self._stop_flag.is_set(): raise asyncio.CancelledError()
             try:
                 resp = await client.post(
                     f"{self.cfg['upload_server']}/api/upload/{file_id}/finish",
@@ -314,7 +362,7 @@ class WorkerEngine:
                     continue
                 resp.raise_for_status()
                 return
-            except FileExistsError: raise
+            except (FileExistsError, asyncio.CancelledError): raise
             except httpx.HTTPError:
                 if attempt == UPLOAD_FINISH_RETRIES:
                     raise RuntimeError("Failed to finalise upload after retries.")
@@ -351,6 +399,7 @@ class WorkerEngine:
             await self.report_job(file_id, "completed", bytes_downloaded=file_size)
 
         except asyncio.CancelledError:
+            self.ui["progress"](ui_job_id, 0.0, "Halted", "Halted", "User Stopped", "ETA: --")
             raise
         except FileExistsError:
             self.ui["log"](f"[{clean_name}] Skipped: already archived (409).")
@@ -362,7 +411,6 @@ class WorkerEngine:
             self.ui["progress"](ui_job_id, 0.0, "Failed", "Failed", safe_err[:40], "ETA: Error")
             await self.report_job(file_id, "failed", error=safe_err)
         finally:
-            # THIS IS FIX #2: Prevents Windows File Lock Permission errors from masking the shutdown signal
             try:
                 job_cache.unlink(missing_ok=True)
                 local_path.with_name(local_path.name + ".aria2").unlink(missing_ok=True)
@@ -372,21 +420,37 @@ class WorkerEngine:
                 pass
 
     async def run_loop(self) -> None:
+        # Create the asyncio.Event here, inside the correct running event loop.
+        self.stop_event = asyncio.Event()
+
+        # Bridge: poll the threading.Event and set the asyncio one when triggered.
+        async def _stop_watcher():
+            while not self._stop_flag.is_set():
+                await asyncio.sleep(0.25)
+            self.stop_event.set()
+
         queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=self.cfg["concurrency"] * 2)
         seen_ids: collections.deque = collections.deque(maxlen=10_000)
 
-        workers = [asyncio.create_task(self._worker(queue)) for _ in range(self.cfg["concurrency"])]
+        self.active_tasks = [asyncio.create_task(self._worker(queue)) for _ in range(self.cfg["concurrency"])]
         await self._recover_interrupted_jobs(queue, seen_ids)
 
         self.ui["log"](f"Worker started. Concurrency={self.cfg['concurrency']} aria2c={'yes' if self.aria2c_path else 'no'} CPUs={os.cpu_count()}")
-        prod = asyncio.create_task(self._producer(queue, seen_ids))
+        self.prod_task = asyncio.create_task(self._producer(queue, seen_ids))
+        watcher_task = asyncio.create_task(_stop_watcher())
 
+        # Completely safe wait block
         await self.stop_event.wait()
+        self.ui["log"]("Initiating shutdown...")
 
-        prod.cancel()
-        for w in workers:
-            w.cancel()
-        await asyncio.gather(prod, *workers, return_exceptions=True)
+        watcher_task.cancel()
+        if self.prod_task:
+            self.prod_task.cancel()
+        for t in self.active_tasks:
+            t.cancel()
+
+        tasks = self.active_tasks + ([self.prod_task] if self.prod_task else [])
+        await asyncio.gather(*tasks, return_exceptions=True)
         self.ui["log"]("Worker stopped cleanly.")
 
     async def _recover_interrupted_jobs(self, queue: asyncio.Queue, seen_ids: collections.deque) -> None:
@@ -398,15 +462,18 @@ class WorkerEngine:
                 cached = json.loads(jf.read_text())
                 if cached["file_id"] not in seen_ids:
                     seen_ids.append(cached["file_id"])
-                    await queue.put(cached)
-                    recovered += 1
+                    try:
+                        queue.put_nowait(cached)
+                        recovered += 1
+                    except asyncio.QueueFull:
+                        pass  # workers will pick up remaining jobs via the producer
             except Exception:
                 pass
         if recovered: self.ui["log"](f"Recovered {recovered} interrupted job(s). Resuming…")
 
     async def _producer(self, queue: asyncio.Queue, seen_ids: collections.deque) -> None:
         async with httpx.AsyncClient(timeout=10.0, limits=self._http_limits) as client:
-            while not self.stop_event.is_set():
+            while not self._stop_flag.is_set():
                 if queue.qsize() >= self.cfg["concurrency"]:
                     await asyncio.sleep(PRODUCER_POLL_INTERVAL)
                     continue
@@ -423,12 +490,13 @@ class WorkerEngine:
                                 await queue.put(job)
                         if not jobs: await asyncio.sleep(PRODUCER_BACKOFF_INTERVAL)
                     else: await asyncio.sleep(PRODUCER_BACKOFF_INTERVAL)
+                except asyncio.CancelledError:
+                    break
                 except httpx.RequestError:
                     await asyncio.sleep(PRODUCER_BACKOFF_INTERVAL)
 
     async def _worker(self, queue: asyncio.Queue) -> None:
-        # THIS IS FIX #3: Instantly drop all queued jobs the moment "Stop" is clicked
-        while not self.stop_event.is_set():
+        while not self._stop_flag.is_set():
             try:
                 job = await asyncio.wait_for(queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
