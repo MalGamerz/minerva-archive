@@ -1,11 +1,18 @@
 name: Build Executables
+
 on:
   push:
     branches: ["main"]
-  # This adds a manual "Run workflow" button to your GitHub Actions tab
-  workflow_dispatch: 
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: 'Version Tag (e.g. 2.0.0-beta). Leave blank to use pyproject.toml.'
+        required: false
+        type: string
+
 permissions:
-  contents: write 
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -24,26 +31,49 @@ jobs:
             artifact: MinervaWorker-Linux-Headless
             pyinstaller_flags: ""
             extra_deps: "."
+
     runs-on: ${{ matrix.os }}
     name: Build ${{ matrix.name }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.11"
-      # AUTOMATION: Extract the version directly from pyproject.toml
-      - name: Extract Version
-        id: extract_version
+
+      - name: Determine Version & Patch Files
+        id: versioning
         shell: bash
         run: |
-          VERSION=$(python -c "import tomllib; data=tomllib.load(open('pyproject.toml','rb')); print(data['project']['version'])")
-          echo "APP_VERSION=v$VERSION" >> $GITHUB_ENV
+          MANUAL_VERSION="${{ inputs.version_tag }}"
+          
+          if [ -n "$MANUAL_VERSION" ]; then
+            echo "Custom version provided: $MANUAL_VERSION"
+            # Strip leading 'v' if you accidentally typed 'v2.0.0-beta'
+            CLEAN_VERSION=${MANUAL_VERSION#v}
+            
+            # Patch config.py (so the worker sends the right version to the API)
+            sed -i "s/VERSION = .*/VERSION = \"$CLEAN_VERSION\"/" config.py
+            
+            # Patch pyproject.toml
+            sed -i "s/version = .*/version = \"$CLEAN_VERSION\"/" pyproject.toml
+            
+            echo "APP_VERSION=v$CLEAN_VERSION" >> $GITHUB_ENV
+          else
+            echo "No custom version provided. Extracting from pyproject.toml..."
+            EXTRACTED=$(python -c "import tomllib; data=tomllib.load(open('pyproject.toml','rb')); print(data['project']['version'])")
+            echo "Found version: $EXTRACTED"
+            echo "APP_VERSION=v$EXTRACTED" >> $GITHUB_ENV
+          fi
+
       - name: Install Python deps
         run: |
           uv pip install pyinstaller
           uv pip install -e "${{ matrix.extra_deps }}"
+
       - name: Build (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -53,6 +83,7 @@ jobs:
             --name "${{ matrix.artifact }}" \
             ${{ matrix.pyinstaller_flags }} \
             main.py
+
       - name: Build (Windows)
         if: runner.os == 'Windows'
         run: |
@@ -62,6 +93,7 @@ jobs:
             --name "${{ matrix.artifact }}" `
             ${{ matrix.pyinstaller_flags }} `
             main.py
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -72,7 +104,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           
-      # PUBLISH: Only create a release if you clicked the manual button
+      # PUBLISH: Only create a release if triggered manually via the UI button
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         if: github.event_name == 'workflow_dispatch'
