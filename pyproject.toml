@@ -12,3 +12,6 @@ dependencies = [
 gui = [
     "customtkinter>=5.2.2",
 ]
+
+[tool.setuptools]
+py-modules = ["main", "engine", "config", "auth", "utils"]
