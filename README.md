@@ -1,28 +1,31 @@
-# Minerva DPN Worker
+# Minerva Archive — DPN Worker (GUI Edition)
 
-A high-performance, single-file Python worker client for the Minerva Distributed Preservation Network. This tool allows volunteers to help archive the internet by efficiently downloading files from source servers and uploading them safely to the Minerva archive.
+A high-performance, graphical worker client for the Minerva Distributed Preservation Network. This tool allows volunteers to help archive the internet by efficiently downloading files from source servers and uploading them safely to the Minerva archive.
+
+This version features a modern, dark-themed UI for real-time tracking of high-bandwidth transfers.
 
 ## Features
 
+* **Modern Graphical Interface:** Built with `customtkinter` for a sleek, responsive dark-mode experience.
+* **Real-Time Telemetry:** Live UI progress bars tracking download speeds (KB/s), exact file sizes (MiB/GiB), and dynamic ETAs directly from `aria2c`.
 * **High-Speed Downloads:** Seamless integration with `aria2c` for accelerated downloading.
-* **Network Saturation:** Process multiple files concurrently to maximize high-bandwidth connections.
-* **Intelligent Rate Limiting:** Hardcoded connection limits and staggered task execution to prevent HTTP 429 (Too Many Requests) IP bans from aggressive source servers.
-* **Real-Time Monitoring:** Live terminal progress bars tracking both `aria2c` downloads and chunked server uploads.
+* **Network Saturation:** Process multiple files concurrently via UI Spinboxes to maximize high-bandwidth connections.
+* **Intelligent Rate Limiting:** Adjustable connection limits and staggered task execution to prevent HTTP 429 (Too Many Requests) IP bans from aggressive source servers.
 * **Chunked Uploads:** Safely uploads massive files by breaking them into 8MB chunks, bypassing standard reverse-proxy (e.g., Cloudflare) file size limits.
-* **Auto-Cleanup:** Automatically purges temporary files immediately after a successful upload to preserve local disk space.
+* **Auto-Cleanup:** Toggleable UI option to automatically purge temporary files immediately after a successful upload to preserve local disk space.
 
 ## Prerequisites
 
 * **Python:** Version 3.10 or higher.
-* **aria2c:** Highly recommended. The script will fall back to standard Python downloads (`httpx`) if not found, but `aria2c` is required for maximum stability and speed.
+* **aria2c:** Highly recommended. The app will fall back to standard Python downloads (`httpx`) if not found, but `aria2c` is required for maximum stability, speed, and real-time ETA tracking.
 
 ## Installation
 
 **1. Install Python Dependencies**
-The script requires a few lightweight libraries to handle terminal UI and network requests:
+The application requires the following libraries to handle the UI and network requests:
 
 ```cmd
-pip install httpx rich click
+pip install customtkinter httpx
 
 ```
 
@@ -37,45 +40,29 @@ Ensure `aria2c` is installed and added to your system's PATH.
 
 ## Usage
 
-### Authentication
-
-Before running the worker, you must authenticate your client with Discord. This generates a secure token saved to `~/.minerva-dpn/token`.
+To launch the application, run the Python file from your terminal:
 
 ```cmd
-python minerva.py login
+python minerva_app.py
 
 ```
 
-This will open a browser window. Once authorized, you can close the tab.
+### 1. Authentication
 
-### Running the Worker
+Before starting the worker engine, click **Login with Discord** in the left sidebar. This will open a browser window to authenticate your client. Once authorized, you can close the browser tab. The app will generate a secure token saved to `~/.minerva-dpn/token`.
 
-To start the automated download and upload process with the default settings (optimized for 4 concurrent files with 1 safe connection each):
+### 2. Configuring Performance
 
-```cmd
-python minerva.py run
+Use the settings grid in the main window to optimize the worker for your network:
 
-```
+* **Concurrency:** The number of files to download/upload simultaneously. (Recommended: 4-8 for high-speed connections).
+* **aria2c Connections:** The number of streams opened per file. *Warning: Keep at 1-3 to prevent aggressive source servers from issuing IP bans.*
+* **Temp Directory:** The local path where files are staged during transit.
+* **Keep files after upload:** Check this box if you want to retain the files locally instead of auto-deleting them.
 
-### CLI Options
+### 3. Running the Worker
 
-You can customize the worker's behavior using the following flags:
-
-| Flag | Long Name | Default | Description |
-| --- | --- | --- | --- |
-| `-c` | `--concurrency` | `4` | Number of files to download/upload simultaneously. |
-| `-b` | `--batch-size` | `10` | Number of jobs to fetch from the server per API request. |
-| `-a` | `--aria2c-connections` | `1` | Connections per file. *Keep at 1 to prevent server bans.* |
-| N/A | `--temp-dir` | `~/.minerva-dpn/tmp` | Local directory for temporary file storage during transit. |
-| N/A | `--keep-files` | `False` | Pass this flag to prevent files from being deleted after upload. |
-
-**Example: High-Concurrency Run**
-If you want to pull 8 files at once while maintaining the safe 1-connection-per-file limit:
-
-```cmd
-python minerva.py run -c 8 -a 1
-
-```
+Click **▶ Start Worker** to begin pulling jobs from the API. You can monitor the live progress, speeds, and ETAs in the **Active Jobs** tab, and view detailed backend events in the **Log** tab.
 
 ## Architecture Notes
 
