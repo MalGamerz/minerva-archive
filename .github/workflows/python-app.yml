@@ -1,120 +1,17 @@
-name: Build Executables
+[project]
+name = "minerva-archive"
+version = "1.3.2"
+description = "High-performance DPN Worker for the Minerva Archive"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.27.0",
+]
 
-on:
-  push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
+[project.optional-dependencies]
+gui = [
+    "customtkinter>=5.2.2",
+]
 
-permissions:
-  contents: read
-
-jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # ── Windows: GUI exe (no console window) ──────────────────────────
-          - os: windows-latest
-            name: Windows-GUI
-            artifact: MinervaWorker-Windows.exe
-            pyinstaller_flags: >-
-              --windowed
-              --collect-all customtkinter
-            extra_deps: ".[gui]"
-
-          # ── macOS (Intel + Apple Silicon via universal2) ───────────────────
-          - os: macos-latest
-            name: macOS
-            artifact: MinervaWorker-macOS
-            pyinstaller_flags: >-
-              --windowed
-              --collect-all customtkinter
-              --target-arch universal2
-              --osx-bundle-identifier org.minerva-archive.worker
-            extra_deps: ".[gui]"
-
-          # ── Linux GUI (requires display — runnable on desktops) ───────────
-          - os: ubuntu-latest
-            name: Linux-GUI
-            artifact: MinervaWorker-Linux-GUI
-            pyinstaller_flags: >-
-              --collect-all customtkinter
-            extra_deps: ".[gui]"
-
-          # ── Linux headless / server (no GUI deps) ─────────────────────────
-          - os: ubuntu-latest
-            name: Linux-Headless
-            artifact: MinervaWorker-Linux-Headless
-            pyinstaller_flags: ""
-            extra_deps: "."
-
-    runs-on: ${{ matrix.os }}
-    name: Build ${{ matrix.name }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          python-version: "3.11"
-
-      # Linux GUI build needs Tk/Tcl headers and a virtual display
-      - name: Install Linux system deps
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            python3-tk tk-dev xvfb
-
-      - name: Install Python deps
-        run: |
-          uv pip install pyinstaller
-          uv pip install -e "${{ matrix.extra_deps }}"
-
-      # macOS: strip quarantine so the binary runs without Gatekeeper prompt
-      - name: Build (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          uv run pyinstaller \
-            --noconfirm \
-            --onefile \
-            --name "${{ matrix.artifact }}" \
-            ${{ matrix.pyinstaller_flags }} \
-            main.py
-          xattr -cr "dist/${{ matrix.artifact }}"
-
-      # Linux GUI: wrap with xvfb so Tk/CTk imports don't crash at collect time
-      - name: Build (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          xvfb-run --auto-servernum uv run pyinstaller \
-            --noconfirm \
-            --onefile \
-            --name "${{ matrix.artifact }}" \
-            ${{ matrix.pyinstaller_flags }} \
-            main.py
-
-      - name: Build (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          uv run pyinstaller `
-            --noconfirm `
-            --onefile `
-            --name "${{ matrix.artifact }}" `
-            ${{ matrix.pyinstaller_flags }} `
-            main.py
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.name }}
-          # Windows produces .exe, everything else has no extension
-          path: |
-            dist/${{ matrix.artifact }}.exe
-            dist/${{ matrix.artifact }}
-          if-no-files-found: error
-          retention-days: 30
+[tool.setuptools]
+py-modules = ["main", "engine", "config", "auth", "utils"]
