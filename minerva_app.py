@@ -305,6 +305,9 @@ class WorkerEngine:
         finally:
             # Clean up the cache and the file
             job_cache_file.unlink(missing_ok=True)
+            # Add these two lines to sweep up the ghost .aria2 files
+            aria2_file = local_path.with_name(local_path.name + ".aria2")
+            aria2_file.unlink(missing_ok=True)
             if not self.cfg['keep_files']:
                 local_path.unlink(missing_ok=True)
 
