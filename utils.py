@@ -1,80 +1,98 @@
 import os
 import re
+import sys
 import urllib.parse
 import random
-import customtkinter as ctk
+import tkinter
 
 
 def secure_filename(filename: str) -> str:
-    """
-    Sanitise a user-supplied or server-supplied filename.
-
-    Defences applied (in order):
-      1. URL-decode to collapse percent-encoded traversal tricks (%2F etc.)
-      2. Strip any directory component so only the final basename survives.
-      3. Collapse whitespace runs to underscores.
-      4. Remove every character that isn't alphanumeric or one of: _ - . ( ) [ ]
-      5. Strip leading/trailing underscores that result from the above.
-      6. Fall back to a safe sentinel when the result is empty.
-    """
     filename = os.path.basename(urllib.parse.unquote(filename))
-    filename = re.sub(r'\s+', '_', filename)
-    filename = re.sub(r'[^a-zA-Z0-9_\-.\(\)\[\]]', '_', filename)
-    return filename.strip('_') or "unnamed_file.bin"
+    filename = re.sub(r"\s+", "_", filename)
+    filename = re.sub(r"[^a-zA-Z0-9_\-\.\(\)\[\]]", "_", filename)
+    return filename.strip("_") or "unnamed_file.bin"
 
 
 def _retry_sleep(attempt: int, cap: float = 15.0, base: float = 0.85) -> float:
-    """
-    Exponential back-off with full jitter.
-
-    Sleep time grows with each attempt up to *cap* seconds, with a random
-    component to spread retries across concurrent workers and avoid thundering
-    herds.  The minimum floor is roughly *base* seconds on the first attempt.
-    """
-    return min(cap, base * attempt + random.random() * 1.25)
+    return min(cap, (base * attempt) + random.random() * 1.25)
 
 
-class CustomSpinbox(ctk.CTkFrame):
-    """A simple integer spinbox built from a CTkEntry flanked by +/- buttons."""
+def secure_write(path, text: str) -> None:
+    """Write text to path, then chmod 600 where supported."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    try:
+        os.chmod(path, 0o600)
+    except (OSError, NotImplementedError):
+        pass  # Windows / some exotic FS — non-fatal
 
-    def __init__(self, master, textvariable, width: int = 120, max_val: int = 9999, **kwargs):
-        super().__init__(master, fg_color="transparent", width=width, **kwargs)
-        self._var = textvariable
-        self._max = max_val
 
-        btn_cfg = dict(width=28, height=28, fg_color="#2B2B2B", hover_color="#3B3B3B")
-        self._btn_sub = ctk.CTkButton(self, text="−", command=self._decrement, **btn_cfg)
-        self._btn_sub.pack(side="left", padx=(0, 4))
-
-        self._entry = ctk.CTkEntry(
-            self,
-            textvariable=self._var,
-            width=width - 64,
-            height=28,
-            justify="center",
-            fg_color="#181818",
-            border_color="#333",
-        )
-        self._entry.pack(side="left")
-
-        self._btn_add = ctk.CTkButton(self, text="+", command=self._increment, **btn_cfg)
-        self._btn_add.pack(side="left", padx=(4, 0))
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _current(self) -> int:
-        """Return the current integer value, defaulting to 1 on parse error."""
+def has_display() -> bool:
+    """Return True if a GUI display is available."""
+    if sys.platform == "win32":
+        return True
+    if sys.platform == "darwin":
+        return True
+    # Linux / BSD: check $DISPLAY / $WAYLAND_DISPLAY, then try Tk
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
         try:
-            return int(self._var.get())
+            root = tkinter.Tk()
+            root.withdraw()
+            root.destroy()
+            return True
+        except Exception:
+            return False
+    return False
+
+
+class CustomSpinbox:
+    """Minimal +/- spinbox for customtkinter — defined here so both GUI
+    entry-points (main.py) can import it from one place."""
+
+    def __init__(self, master, textvariable, width=120, max_val=9999, **kw):
+        try:
+            import customtkinter as ctk
+        except ImportError:
+            raise RuntimeError("customtkinter is required for GUI mode")
+
+        self._frame = ctk.CTkFrame(master, fg_color="transparent", width=width, **kw)
+        self.textvariable = textvariable
+        self.max_val = max_val
+
+        ctk.CTkButton(
+            self._frame, text="-", width=28, height=28,
+            fg_color="#2B2B2B", hover_color="#3B3B3B", command=self._sub,
+        ).pack(side="left", padx=(0, 4))
+
+        ctk.CTkEntry(
+            self._frame, textvariable=textvariable,
+            width=width - 64, height=28, justify="center",
+            fg_color="#181818", border_color="#333",
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            self._frame, text="+", width=28, height=28,
+            fg_color="#2B2B2B", hover_color="#3B3B3B", command=self._add,
+        ).pack(side="left", padx=(4, 0))
+
+    def pack(self, **kw):
+        self._frame.pack(**kw)
+
+    def grid(self, **kw):
+        self._frame.grid(**kw)
+
+    def _add(self):
+        try:
+            v = int(self.textvariable.get())
+            if v < self.max_val:
+                self.textvariable.set(str(v + 1))
         except ValueError:
-            return 1
+            self.textvariable.set("1")
 
-    def _increment(self) -> None:
-        val = self._current()
-        self._var.set(str(min(val + 1, self._max)))
-
-    def _decrement(self) -> None:
-        val = self._current()
-        self._var.set(str(max(val - 1, 1)))
+    def _sub(self):
+        try:
+            v = int(self.textvariable.get())
+            if v > 1:
+                self.textvariable.set(str(v - 1))
+        except ValueError:
+            self.textvariable.set("1")
